@@ -389,6 +389,9 @@ def main() -> int:
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
+    ap.add_argument("--no-convert", action="store_true",
+                    help="leave a K-quant's dense matrices (attn/head/embeddings in Q4_K/Q5_K/Q6_K) as they are: the "
+                         "engine reads those only as BF16/Q8_0/EXL3, so it refuses the pack without the conversion")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
@@ -512,6 +515,54 @@ def main() -> int:
     # the DSpark drafter (drafter_pack.py's dspark.bin beside the quants' folders, from DeepSeek's checkpoint): its
     # three blocks as mtp.0-2, so the engine drafts with them
     files = names
+    # A K-quant GGUF outside the Maya recipe - an "abliterated" Mix quant keeps its attn in Q4_K/Q5_K and its head and
+    # embeddings in Q6_K - meets a dense read that takes BF16/Q8_0 (ds4_model.cu's mat_bf16) and EXL3.  New kernels for
+    # the K formats would pay their dequantization in the hot GEMMs every token, forever; repacking these few tensors
+    # to Q8_0 once, here, beside the model, reads fine: the Q8_0 grid is finer than the source's own 4-/5-/6-bit one,
+    # so the requant error is the source's, not ours.  The routed experts (the iq kernels read them as they are) and
+    # the Engram tables (their own dequantizations, Q6_K and IQ4_NL) keep their bytes.
+    if not a.no_convert:
+        conv = [i for i, t in enumerate(tensors)
+                if t[1] in ("Q4_K", "Q5_K", "Q6_K") and ".ffn.experts." not in t[0] and ".engram.embed." not in t[0]]
+        if conv:
+            try:
+                from k_quant import dequant, quant_q8_0   # (beside this file)
+            except ImportError:
+                sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+                from k_quant import dequant, quant_q8_0
+            import mmap
+            out.mkdir(parents=True, exist_ok=True)
+            cpath = out / "converted.bin"
+            files.append(rel(cpath))
+            cf = len(files) - 1
+            n_by, opens = {}, []
+            with cpath.open("wb") as w:
+                cur = 0
+                for i in conv:
+                    name, dt, fi, base, nb, shape = tensors[i]
+                    nel = 1
+                    for d in shape:
+                        nel *= d
+                    p = gs_all[fi].path
+                    mm = next((m for m, _f, p0 in opens if p0 == p), None)
+                    if mm is None:
+                        fh = p.open("rb")
+                        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                        opens.append((mm, fh, p))
+                    q8 = quant_q8_0(dequant(dt, mm[base:base + nb], nel))
+                    off = (cur + 255) // 256 * 256
+                    if off != cur:
+                        w.write(b"\0" * (off - cur))
+                        cur = off
+                    w.write(q8)
+                    cur += len(q8)
+                    n_by[dt] = n_by.get(dt, 0) + 1
+                    tensors[i] = (name, "Q8_0", cf, off, len(q8), shape)
+                for m0, f0, _ in opens:
+                    m0.close()
+                    f0.close()
+            print("repacked to Q8_0 in %s (%.1f GB): %s" %
+                  (cpath, cur / 1e9, ", ".join("%d %s" % (v, k) for k, v in sorted(n_by.items()))))
     if eg_from:
         print("Engram tables from %s (%d shards)" % (eg_dir, len(eg_from)))
     drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
