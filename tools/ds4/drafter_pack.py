@@ -22,6 +22,8 @@ import sys
 import numpy as np
 
 SHARDS = ("model-00044-of-00048.safetensors", "model-00045-of-00048.safetensors", "model-00046-of-00048.safetensors")
+DSPARK_KEYS = ("dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank", "dspark_n_routed_experts",
+               "dspark_num_experts_per_tok", "dspark_target_layer_ids")   # (the six the engine reads; a 0 is a hole)
 ALIGN = 256
 
 
@@ -81,6 +83,42 @@ QTYPES = {"Q8_0": (8, 32, 34), "Q2_K": (10, 256, 84), "Q3_K": (11, 256, 110), "Q
           "IQ1_M": (29, 256, 56)}
 DENSE_KEEP = ("markov_head", "confidence_head", "norm", "hc_", "ffn.gate.", "attn_sink")
 E2M1 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
+
+
+def find_config(d: pathlib.Path, explicit=None) -> pathlib.Path | None:
+    """the checkpoint's config.json (where the trunk's dspark_* geometry is defined): --config when given (and it then
+    had better be there), else the drafter's own folder, then its parent - the setup fetches the drafter's shards and
+    config.json (download_gguf.json's "drafter") into a fresh folder, and a manual run beside the base model's
+    checkpoint finds it the same way."""
+    if explicit:
+        c = pathlib.Path(explicit).expanduser()
+        if not c.is_file():
+            raise SystemExit("--config %s: no config.json there" % c)
+        return c
+    return next((c for c in [d / "config.json", d.parent / "config.json"] if c.is_file()), None)
+
+
+def drafter_config(cpath) -> dict:
+    """the checkpoint config.json's dspark_* keys as drafter.json's config ({} when there is no file to read);
+    a checkpoint config nests the model keys under text_config, so walk the tree (a repeated name deeper wins)."""
+    if cpath is None or not pathlib.Path(cpath).is_file():
+        return {}
+    acc = {}
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(k, str) and k.startswith("dspark_"):
+                    acc[k] = v
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+        return acc
+
+    cfg = walk(json.loads(pathlib.Path(cpath).read_text()))
+    return {"config": cfg} if cfg else {}
 
 
 def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs: int, out=None) -> int:
@@ -147,8 +185,9 @@ def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs
                 off += q.nbytes
                 prev = role
     (o / ("dspark-%s.bin.part" % name)).replace(o / ("dspark-%s.bin" % name))
+    cfg = {"config": src["config"]} if "config" in src else {}   # (the trunk geometry the pack needs, unchanged)
     (o / ("dspark-%s.json" % name)).write_text(json.dumps({"from": "dspark.bin", "experts": experts, "dense": dense,
-                                                          "tensors": entries}))
+                                                           **cfg, "tensors": entries}))
     print("dspark-%s.bin: %d tensors, %.2f GB (experts %s, dense %s)" % (name, len(entries), off / 1e9, experts, dense))
     return 0
 
@@ -156,6 +195,9 @@ def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", required=True, help="the folder with the drafter's three shards")
+    ap.add_argument("--config", help="the checkpoint's config.json the dspark_* geometry is read from "
+                                     "(default: <dir>/config.json, then <dir>/../config.json - the base model's "
+                                     "checkpoint beside the drafter's folder)")
     ap.add_argument("--requant", metavar="NAME",
                     help="from dspark.bin there: dspark-NAME.bin with --experts / --dense types (ggml's quantizers)")
     ap.add_argument("--experts", default="IQ4_XS", help="(--requant) the routed experts' type, or keep")
@@ -168,6 +210,27 @@ def main() -> int:
     d = pathlib.Path(a.dir)
     if a.requant:
         return requant(d, a.requant, a.experts, a.dense, a.lib, a.jobs, a.out)
+    if not (d / SHARDS[0]).is_file() and (d / "dspark.json").is_file():
+        # an install predating the geometry (an older setup's dspark/: its shards were converted and deleted long
+        # ago): merge the checkpoint's geometry into the dspark.json that is there - there is nothing else to convert
+        dj = json.loads((d / "dspark.json").read_text())
+        have = dj.get("config") or {}
+        want = [k for k in DSPARK_KEYS if not have.get(k)]
+        if not want:
+            print("dspark.json: the trunk's geometry is already there")
+            return 0
+        cpath = find_config(d, a.config)
+        cfg = drafter_config(cpath).get("config") or {}
+        add = {k: cfg[k] for k in want if cfg.get(k)}
+        if not add:
+            raise SystemExit("%s: no shards to convert there, and %s to merge from" %
+                             (d, "no config.json" if not cpath else "%s carries none of the keys it lacks" % cpath))
+        # (the record reads exactly as a fresh conversion writes it: from, config, then everything else)
+        dj = {"from": dj.get("from"), "config": {**have, **add},
+              **{k: v for k, v in dj.items() if k not in ("from", "config")}}
+        (d / "dspark.json").write_text(json.dumps(dj))
+        print("dspark.json: added %d of the trunk's geometry keys from %s" % (len(add), cpath))
+        return 0
     entries, off = [], 0
     exp = re.compile(r"(mtp\.\d+\.ffn\.experts\.)(\d+)\.(w[123])\.weight$")
 
@@ -208,8 +271,13 @@ def main() -> int:
                 off += pad
             del raw
     (d / "dspark.bin.part").replace(d / "dspark.bin")
-    (d / "dspark.json").write_text(json.dumps({"from": list(SHARDS), "tensors": entries}))
-    print(f"dspark.bin: {len(entries)} tensors, {off / 1e9:.2f} GB")
+
+    cpath = find_config(d, a.config)
+    cfg = drafter_config(cpath)
+    (d / "dspark.json").write_text(json.dumps({"from": list(SHARDS), **cfg, "tensors": entries}))
+    print(f"dspark.bin: {len(entries)} tensors, {off / 1e9:.2f} GB"
+          + ("" if cfg else " (no config.json found: the trunk's dspark_* geometry is not recorded)" if not cpath
+             else " (%s carries no dspark_* keys: the trunk's geometry is not recorded)" % cpath))
     return 0
 
 

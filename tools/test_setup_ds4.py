@@ -627,6 +627,33 @@ class MayaQuants(unittest.TestCase):
                 self.assertTrue(maya.ds4_drafter_step(args(), d))
             self.assertEqual(dl.call_count, 1)
 
+    def test_an_old_drafter_install_upgrades_its_geometry(self):
+        """installs predating the geometry (a dspark.json without config): the setup fetches the checkpoint's
+        config.json and runs the merge (drafter_pack.py --dir, which sees no shards and only merges); an install
+        whose dspark.json carries config downloads nothing."""
+        d = self.tmp / "dspark"
+        d.mkdir()
+        (d / "dspark.bin").write_bytes(b"\0")
+        (d / "dspark.json").write_text(json.dumps({"from": ["model-00044-of-00048.safetensors"], "tensors": []}))
+
+        def fetch(a, what, dd, want, m):
+            self.assertEqual([str(p) for p in want], [str(d / "config.json")])
+            self.assertIn("config.json", m["files"])          # (the manifest's own size and hash, not a new list)
+            (dd / "config.json").write_text(json.dumps({"text_config": {"dspark_block_size": 5}}))
+            return True
+
+        with patch.object(maya, "offer_download", side_effect=fetch), patch.object(maya, "run") as conv:
+            self.assertTrue(maya.ds4_drafter_step(args(), d))
+        self.assertEqual(conv.call_count, 1)                  # (the merge, shards or none)
+        self.assertEqual(conv.call_args[0][0][-2:], ["--dir", str(d)])
+
+        (d / "dspark.json").write_text(json.dumps({"from": ["x"], "config": {k: 1 for k in (
+            "dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank", "dspark_n_routed_experts",
+            "dspark_num_experts_per_tok", "dspark_target_layer_ids")}, "tensors": []}))
+        with patch.object(maya, "offer_download") as dl:
+            self.assertTrue(maya.ds4_drafter_step(args(), d))
+        self.assertEqual(dl.call_count, 0)
+
     def test_maya_s_one_split(self):
         """Maya-S is one GGUF split of 6 shards with its Engram tables (Q6_K, shards 5 and 6), from Maya's repo."""
         m = maya.ds4_gguf_model("maya-s")

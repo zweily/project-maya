@@ -362,6 +362,23 @@ def write_tokenizer(out: pathlib.Path, kv: dict, template: str | None):
         (out / "chat_template.jinja").write_text(template, encoding="utf-8")
 
 
+DSPARK_GEOMETRY = {"dspark_block_size": "block_size", "dspark_noise_token_id": "noise_token_id",
+                   "dspark_markov_rank": "markov_rank", "dspark_n_routed_experts": "expert_count",
+                   "dspark_num_experts_per_tok": "expert_used_count", "dspark_target_layer_ids": "target_layers"}
+
+
+def dspark_fill(kv: dict, arch: str, dcfg: dict) -> list:
+    """fill the trunk's DSpark geometry keys the GGUF's metadata left out (0 counts as left out: it is what turns the
+    drafter off) from the drafter's own record; what the GGUF states stands.  Returns the keys filled."""
+    added = []
+    for k, gk in DSPARK_GEOMETRY.items():
+        key = "%s.dspark.%s" % (arch, gk)
+        if not kv.get(key) and dcfg.get(k):
+            kv[key] = dcfg[k]
+            added.append(key)
+    return added
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
@@ -501,10 +518,18 @@ def main() -> int:
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
     drafter_in = drafter.is_file() and drafter.with_suffix(".bin").is_file()
+    dmeta = json.loads(drafter.read_text()) if drafter_in else None
+    if dmeta is not None:
+        # a GGUF quant whose metadata has no dspark.* keys (an "abliterated" Mix quant of the base model, a GSQ one)
+        # still runs the drafter: the geometry is the base model's, and drafter_pack.py keeps it from the checkpoint's
+        # config.json.  Key by key, and only where the GGUF left a hole - its own metadata always wins.
+        added = dspark_fill(kv, arch, dmeta.get("config") or {})
+        if added:
+            print("dspark geometry from the drafter's record: %s" % ", ".join(sorted(added)))
     if drafter_in:
         files.append(rel(drafter.with_suffix(".bin")))
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
-        for name, dt, off, nb, shape in json.loads(drafter.read_text())["tensors"]:
+        for name, dt, off, nb, shape in dmeta["tensors"]:
             if name.endswith(".attn.wo_a.weight"):   # (one entry a group, as the trunk's)
                 for i in range(groups):
                     tensors.append(("%s.slice.%d.weight" % (name[:-len(".weight")], i), dt, len(files) - 1,

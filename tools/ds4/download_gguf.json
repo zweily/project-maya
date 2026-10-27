@@ -319,10 +319,14 @@
   }
  },
  "drafter": {
-  "_": "DeepSeek's DSpark drafter (the speculative decoder the GGUFs leave out): the three shards of DeepSeek's own checkpoint that hold only its blocks (mtp.0-2), at the revision the Engram tables come from; tools/ds4/drafter_pack.py makes them the GGUF path's formats (dspark.bin, beside the quants' folders).",
+  "_": "DeepSeek's DSpark drafter (the speculative decoder the GGUFs leave out): the three shards of DeepSeek's own checkpoint that hold only its blocks (mtp.0-2), at the revision the Engram tables come from, and the checkpoint's config.json - its text_config's dspark_* geometry, which drafter_pack.py keeps in dspark.json for pack_gguf.py to fill into a quant whose metadata has none; tools/ds4/drafter_pack.py makes the shards the GGUF path's formats (dspark.bin, beside the quants' folders).",
   "repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
   "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
   "files": {
+   "config.json": [
+    3311,
+    "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
+   ],
    "model-00044-of-00048.safetensors": [
     2652728736,
     "3e8ac315c2bcca3e83c5e6e25c5758a75c03732063a6ff0c1b0e24b9ff49f6e6"

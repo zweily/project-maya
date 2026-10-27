@@ -3601,7 +3601,18 @@ def ds4_drafter_step(a, d: Path, quant: str | None = None) -> bool:
             return False
         ok(f"the DSpark drafter: {d / own['json']}")
         return True
+    m = ds4_drafter_model()
     if (d / "dspark.bin").is_file() and (d / "dspark.json").is_file():
+        dcfg = read_json(d / "dspark.json").get("config") or {}
+        if any(not dcfg.get(k) for k in ("dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank",
+                                         "dspark_n_routed_experts", "dspark_num_experts_per_tok",
+                                         "dspark_target_layer_ids")):
+            # an install predating the geometry (or half of it): fetch the checkpoint's config.json (3.3 KB) and
+            # merge it into dspark.json (its shards are long converted: drafter_pack.py sees no shards and merges)
+            cm = {**m, "files": {"config.json": m["files"]["config.json"]},
+                  "sha256": {"config.json": m["sha256"]["config.json"]}, "download_gb": 3.4e-6}
+            if offer_download(a, "the DSpark drafter's checkpoint config", d, [d / "config.json"], cm):
+                run([sys.executable, str(ROOT / "tools" / "ds4" / "drafter_pack.py"), "--dir", str(d)])
         ok(f"the DSpark drafter: {d / 'dspark.bin'}")
         return True
     mm = ds4_maya_drafter_model()
@@ -3612,7 +3623,6 @@ def ds4_drafter_step(a, d: Path, quant: str | None = None) -> bool:
             return False
         ok(f"the DSpark drafter: {d / 'dspark.bin'}")
         return True
-    m = ds4_drafter_model()
     shards = [d / n for n in m["files"]]
     if any(file_incomplete(m, f) for f in shards) and not offer_download(a, "the DSpark drafter", d, shards, m):
         warn("the DSpark drafter was not downloaded: the model runs without it")
@@ -3621,8 +3631,9 @@ def ds4_drafter_step(a, d: Path, quant: str | None = None) -> bool:
     run([sys.executable, str(ROOT / "tools" / "ds4" / "drafter_pack.py"), "--dir", str(d)])
     if not (d / "dspark.bin").is_file():
         fail("the drafter's conversion did not write dspark.bin", "the reason is in the messages above")
-    for f in shards:                                   # (the setup's own download, now in dspark.bin)
-        f.unlink(missing_ok=True)
+    for f in shards:                                   # (the setup's own download, now in dspark.bin; the
+        if f.name != "config.json":                    #  checkpoint's config.json stays: the record a rerun reads)
+            f.unlink(missing_ok=True)
     ok(f"the DSpark drafter: {d / 'dspark.bin'}")
     return True
 
